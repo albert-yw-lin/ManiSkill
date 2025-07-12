@@ -203,17 +203,22 @@ def main():
             break
 
         # Visualize observation
-        if key == "v":
+        if key == "p":
             if "pointcloud" in env.obs_mode:
                 import trimesh
 
                 xyzw = obs["pointcloud"]["xyzw"]
-                mask = xyzw[..., 3] > 0
+                # mask = xyzw[..., 3] > 0
+                mask = xyzw[0, :, 3] > 0  # Remove batch dimension
                 rgb = obs["pointcloud"]["rgb"]
                 if "robot_seg" in obs["pointcloud"]:
                     robot_seg = obs["pointcloud"]["robot_seg"]
                     rgb = np.uint8(robot_seg * [11, 61, 127])
-                trimesh.PointCloud(xyzw[mask, :3], rgb[mask]).show()
+                # trimesh.PointCloud(xyzw[mask, :3], rgb[mask]).show()
+                # Move tensors to CPU before converting to numpy
+                xyzw_cpu = xyzw[0, mask, :3].cpu().numpy()
+                rgb_cpu = rgb[0, mask].cpu().numpy()
+                trimesh.PointCloud(xyzw_cpu, rgb_cpu).show()
 
         # -------------------------------------------------------------------------- #
         # Post-process action

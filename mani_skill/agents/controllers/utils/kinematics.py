@@ -248,3 +248,68 @@ class Kinematics:
                 )
             else:
                 return None
+
+    def compute_jacobian(self, q: torch.Tensor):
+        """Compute the geometric Jacobian matrix for the arm joints
+        
+        Args:
+            q (torch.Tensor): joint positions for all active joints in the articulation
+            
+        Returns:
+            torch.Tensor: Jacobian matrix of shape (batch_size, 6, num_controlled_joints)
+                         mapping joint velocities to end-effector twist [vx, vy, vz, wx, wy, wz]
+        """
+        if self.use_gpu_ik:
+            # Extract joint positions for the kinematic chain
+            q_chain = q[:, self.active_ancestor_joint_idxs]
+            
+            # Compute full Jacobian using pytorch_kinematics
+            jacobian = self.pk_chain.jacobian(q_chain)  # Shape: (batch, 6, num_ancestor_joints)
+            
+            # Return only the columns corresponding to controlled joints
+            return jacobian[:, :, self.qmask]  # Shape: (batch, 6, num_controlled_joints)
+        
+        else:
+            # CPU case using PinocchioModel
+            q_pmodel = q[:, self.pmodel_active_joint_indices]
+            
+            # For now, return None to indicate unsupported - could be implemented if needed
+            # The PinocchioModel should have jacobian computation capabilities
+            return None
+
+    def compute_forward_kinematics(self, q: torch.Tensor):
+        """Compute forward kinematics to get end-effector pose given joint positions
+        
+        Args:
+            q (torch.Tensor): joint positions for the controlled joints
+            
+        Returns:
+            Pose: end-effector pose relative to the kinematic chain root
+        """
+        if self.use_gpu_ik:
+            # Extract joint positions for the kinematic chain
+            # q should already be the right size for the controlled joints
+            # Map from controlled joints to the ancestor joint positions
+            q_ancestor = torch.zeros(q.shape[0], len(self.active_ancestor_joints), 
+                                   device=self.device, dtype=q.dtype)
+            q_ancestor[:, self.controlled_joints_idx_in_qmask] = q
+            
+            # Compute forward kinematics using pytorch_kinematics
+            transform = self.pk_chain.forward_kinematics(q_ancestor)
+            
+            # Extract position and rotation from transform
+            T = transform.get_matrix()  # (batch, 4, 4)
+            pos = T[:, :3, 3]  # (batch, 3)
+            rot_mat = T[:, :3, :3]  # (batch, 3, 3)
+            
+            # Convert rotation matrix to quaternion
+            from mani_skill.utils.geometry.rotation_conversions import matrix_to_quaternion
+            quat = matrix_to_quaternion(rot_mat)
+            
+            # Create Pose object
+            ee_pose = Pose.create_from_pq(pos, quat)
+            return ee_pose
+        else:
+            # CPU case using PinocchioModel
+            # This is a simplified implementation - can be expanded if needed
+            raise NotImplementedError("CPU forward kinematics not implemented yet")

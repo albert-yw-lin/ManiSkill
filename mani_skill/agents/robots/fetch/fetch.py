@@ -9,6 +9,7 @@ import torch
 from mani_skill import PACKAGE_ASSET_DIR
 from mani_skill.agents.base_agent import BaseAgent, Keyframe
 from mani_skill.agents.controllers import *
+from mani_skill.agents.controllers.whole_body_controller import WholeBodyControllerConfig
 from mani_skill.agents.registration import register_agent
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
@@ -255,6 +256,22 @@ class Fetch(BaseAgent):
             force_limit=500,
         )
 
+        # -------------------------------------------------------------------------- #
+        # Whole Body Controller
+        # -------------------------------------------------------------------------- #
+        whole_body_controller = WholeBodyControllerConfig(
+            joint_names=self.arm_joint_names + self.base_joint_names + ["torso_lift_joint"],
+            arm_joint_names=self.arm_joint_names,
+            base_joint_names=self.base_joint_names + ["torso_lift_joint"],
+            urdf_path=self.urdf_arm_ik_path,
+            ee_link_name=self.ee_link_name,
+            base_link_name="base_link",
+            stiffness=self.arm_stiffness,
+            damping=self.arm_damping,
+            force_limit=self.arm_force_limit,
+            neutral_posture=self.keyframes["rest"].qpos,
+        )
+
         controller_configs = dict(
             pd_joint_delta_pos=dict(
                 arm=arm_pd_joint_delta_pos,
@@ -330,6 +347,8 @@ class Fetch(BaseAgent):
                 body=stiff_body_pd_joint_pos,
                 base=base_pd_joint_vel,
             ),
+            # Whole Body Controller
+            whole_body=whole_body_controller,
         )
 
         # Make a deepcopy in case users modify any config
