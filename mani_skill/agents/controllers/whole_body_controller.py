@@ -77,6 +77,8 @@ class WholeBodyController(BaseController):
         self.timestep = 1.0 / self._control_freq
         
         # Neutral posture for regularization (extract only WBC DOF)
+        # NOTE: While we extract all 11 WBC DOF, only torso_lift and arm joints are regularized.
+        # Mobile base position (x, y, theta) is excluded from posture regularization.
         if self.config.neutral_posture is not None:
             # Extract only the 11 DOF we control: base(4) + arm(7)
             # Actual Fetch active joint order: [base_x, base_y, base_theta, torso_lift, head_pan, shoulder_pan, head_tilt, arm_joints...]
@@ -144,6 +146,13 @@ class WholeBodyController(BaseController):
                 
         self.active_joint_indices = torch.tensor(joint_indices, device=self.device, dtype=torch.int32)
         
+        # Identify non-controlled joints (like head joints, gripper joints)
+        all_active_joints = self.articulation.get_active_joints()
+        all_joint_indices = list(range(len(all_active_joints)))
+        self.non_controlled_joint_indices = [idx for idx in all_joint_indices if idx not in joint_indices]
+        self.non_controlled_joints = [all_active_joints[idx] for idx in self.non_controlled_joint_indices]
+        self.non_controlled_joint_indices = torch.tensor(self.non_controlled_joint_indices, device=self.device, dtype=torch.int32)
+        
         # Ensure we have the expected number of joints
         #NOTE: why do we need to make sure there is base joints but not assume there are?
         expected_joints = len(self.config.arm_joint_names) + (len(self.config.base_joint_names) if self.config.base_joint_names else 0)
@@ -151,6 +160,12 @@ class WholeBodyController(BaseController):
             print(f"Warning: Expected {expected_joints} joints but found {len(self.joints)}")
             print(f"Expected joint names: {joint_names}")
             print(f"Found joint names: {[j.name for j in self.joints]}")
+        
+        # Print information about non-controlled joints for debugging
+        if len(self.non_controlled_joints) > 0:
+            print(f"WholeBodyController: Found {len(self.non_controlled_joints)} non-controlled joints that will be held in place:")
+            for joint in self.non_controlled_joints:
+                print(f"  - {joint.name}")
 
     def _initialize_action_space(self):
         """Initialize action space for desired end-effector pose"""
@@ -178,6 +193,7 @@ class WholeBodyController(BaseController):
 
     def set_drive_property(self):
         """Set drive properties for joints"""
+        # Set drive properties for controlled joints
         for joint in self.joints:
             joint.set_drive_properties(
                 stiffness=self.config.stiffness,
@@ -185,11 +201,35 @@ class WholeBodyController(BaseController):
                 force_limit=self.config.force_limit,
                 mode=self.config.drive_mode
             )
+        
+        # Set drive properties for non-controlled joints to hold them in place
+        # Use moderate stiffness and damping to prevent drifting without being too stiff
+        if len(self.non_controlled_joints) > 0:
+            hold_stiffness = self.config.stiffness * 0.5  # Use half the stiffness for holding
+            hold_damping = self.config.damping * 0.8     # Use slightly less damping for stability
+            
+            for joint in self.non_controlled_joints:
+                joint.set_drive_properties(
+                    stiffness=hold_stiffness,
+                    damping=hold_damping,
+                    force_limit=self.config.force_limit,
+                    mode=self.config.drive_mode
+                )
 
     def reset(self):
         """Reset controller state"""
         self._target_pose = None
         
+        # Hold non-controlled joints at their current positions after reset
+        # This ensures they don't drift even after environment resets
+        if hasattr(self, 'non_controlled_joints') and len(self.non_controlled_joints) > 0:
+            current_qpos = self.articulation.get_qpos()
+            non_controlled_current_qpos = current_qpos[..., self.non_controlled_joint_indices]
+            
+            self.articulation.set_joint_drive_targets(
+                non_controlled_current_qpos, self.non_controlled_joints, self.non_controlled_joint_indices
+            )
+
     def compute_end_effector_pose(self, q):
         """Forward kinematics to get current end-effector pose"""
         # Use kinematics solver for forward kinematics
@@ -222,10 +262,13 @@ class WholeBodyController(BaseController):
         T_base[:, 2, 2] = 1.0
         T_base[:, 3, 3] = 1.0
         
-        # Translation (x, y, torso_lift)
+        # Translation (x, y, z) 
+        # The torso_lift_joint origin is at xyz="-0.086875 0 0.37743" relative to base_link
+        # So we need to add this offset plus the current torso_lift position
+        base_z_offset = 0.37743  # Base offset from URDF torso_lift_joint origin
         T_base[:, 0, 3] = base_x
         T_base[:, 1, 3] = base_y
-        T_base[:, 2, 3] = torso_lift
+        T_base[:, 2, 3] = base_z_offset + torso_lift
         
         # Combine base transformation with arm end-effector pose
         # ee_pose_relative is relative to torso_lift_link
@@ -410,12 +453,24 @@ class WholeBodyController(BaseController):
         g_track = -self.W_ee * (J_np.T @ e_np)
         
         # Posture regularization: ||q_current + q_dot * dt - q_retract||^2
+        # NOTE: Only apply to torso_lift and arm joints, NOT to mobile base position (x, y, theta)
         if self.q_retract is not None:
             q_retract_np = self.q_retract.detach().cpu().numpy() if torch.is_tensor(self.q_retract) else self.q_retract
             if len(q_retract_np) == len(q_np):
-                q_diff = q_np - q_retract_np
-                H_posture = self.W_posture * np.eye(n_vars)
-                g_posture = self.W_posture * self.timestep * q_diff
+                # Create posture regularization matrix that excludes mobile base position (first 3 DOF)
+                H_posture = np.zeros((n_vars, n_vars))
+                g_posture = np.zeros(n_vars)
+                
+                # Only regularize torso_lift (index 3) and arm joints (indices 4-10)
+                # Skip mobile base position: base_x (0), base_y (1), base_theta (2)
+                posture_indices = list(range(3, n_vars))  # torso_lift + arm joints
+                
+                if len(posture_indices) > 0:
+                    q_diff = q_np - q_retract_np
+                    # Apply regularization only to non-base DOF
+                    for i in posture_indices:
+                        H_posture[i, i] = self.W_posture
+                        g_posture[i] = self.W_posture * self.timestep * q_diff[i]
             else:
                 H_posture = np.zeros((n_vars, n_vars))
                 g_posture = np.zeros(n_vars)
@@ -433,7 +488,7 @@ class WholeBodyController(BaseController):
         g = g_track + g_posture + g_damping
         
         # Ensure H is positive definite
-        H += 1e-6 * np.eye(n_vars)
+        H += 1e-3 * np.eye(n_vars)
         
         # Validate QP matrices
         if np.any(np.isnan(H)) or np.any(np.isinf(H)) or np.any(np.isnan(g)) or np.any(np.isinf(g)):
@@ -523,10 +578,23 @@ class WholeBodyController(BaseController):
         self.set_drive_targets(q_target)
 
     def set_drive_targets(self, targets):
-        """Set drive targets for controlled joints"""
+        """Set drive targets for controlled joints and hold non-controlled joints at current positions"""
+        # Set targets for controlled joints
         self.articulation.set_joint_drive_targets(
             targets, self.joints, self.active_joint_indices
         )
+        
+        # Hold non-controlled joints (like head joints) at their current positions
+        # This prevents them from drifting due to inertia when the robot moves
+        if len(self.non_controlled_joints) > 0:
+            # Get current positions of non-controlled joints
+            current_qpos = self.articulation.get_qpos()
+            non_controlled_current_qpos = current_qpos[..., self.non_controlled_joint_indices]
+            
+            # Set drive targets for non-controlled joints to their current positions
+            self.articulation.set_joint_drive_targets(
+                non_controlled_current_qpos, self.non_controlled_joints, self.non_controlled_joint_indices
+            )
 
     def get_state(self) -> dict:
         """Get controller state"""
@@ -600,29 +668,29 @@ class WholeBodyControllerConfig(ControllerConfig):
     base_link_name: str = None
     """Name of base link"""
     
-    # Control parameters
+    # # Control parameters
     stiffness: Union[float, List[float]] = 1000.0
     damping: Union[float, List[float]] = 100.0
     force_limit: Union[float, List[float]] = 100.0
     
     # WBC weights
-    ee_tracking_weight: float = 1.0
+    ee_tracking_weight: float = 1.0  # Reduced from 10.0 to be less aggressive
     """Weight for end-effector tracking objective"""
-    posture_regularization_weight: float = 0.2
+    posture_regularization_weight: float = 2e-2  # Increased from 1.0 for stability
     """Weight for posture regularization"""
-    base_damping_weight: float = 1.5
+    base_damping_weight: float = 1.5  # Increased from 1.5 to reduce oscillations
     """Weight for base damping"""
     
     # Solver parameters
-    max_iterations: int = 20
+    max_iterations: int = 20  # Reduced for smaller per-step changes
     """Maximum iterations for iterative IK"""
-    convergence_threshold: float = 1e-4
+    convergence_threshold: float = 1e-4  # Tighter convergence threshold
     """Convergence threshold for IK"""
     
     # Limits
     pos_limits: Optional[tuple] = None
     """Position limits for end-effector (min, max)"""
-    velocity_limits: Optional[tuple] = (-1.0, 1.0)
+    velocity_limits: Optional[tuple] = (-0.5, 0.5)  # More conservative velocity limits
     """Velocity limits for joints (min, max)"""
     position_limits: Optional[tuple] = None
     """Position limits for joints (min, max)"""
@@ -638,7 +706,7 @@ class WholeBodyControllerConfig(ControllerConfig):
     """Range for collision detection (10cm)"""
     
     # Control mode
-    normalize_action: bool = True
+    normalize_action: bool = False
     drive_mode: DriveMode = "force"
     
     controller_cls = WholeBodyController
