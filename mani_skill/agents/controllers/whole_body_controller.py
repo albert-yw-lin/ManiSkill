@@ -75,6 +75,10 @@ class WholeBodyController(BaseController):
         self.max_iterations = self.config.max_iterations
         self.convergence_threshold = self.config.convergence_threshold
         self.timestep = 1.0 / self._control_freq
+        self.lm_damping_factor = self.config.lm_damping_factor
+        
+        # Setup velocity limits per joint type
+        self._setup_velocity_limits()
         
         # Neutral posture for regularization (extract only WBC DOF)
         # NOTE: While we extract all 11 WBC DOF, only torso_lift and arm joints are regularized.
@@ -94,10 +98,44 @@ class WholeBodyController(BaseController):
         else:
             self.q_retract = None
         
-        # Collision parameters (optional)
-        self.collision_margin = self.config.collision_margin
-        self.collision_detection_range = self.config.collision_detection_range
+        # # Collision parameters (optional)
+        # self.collision_margin = self.config.collision_margin
+        # self.collision_detection_range = self.config.collision_detection_range
+
+    def _setup_velocity_limits(self):
+        """Setup per-joint velocity limits based on configuration"""
+        # Total DOF: 4 base + 7 arm = 11
+        self.velocity_limits_min = np.zeros(self.total_dof)
+        self.velocity_limits_max = np.zeros(self.total_dof)
         
+        # Base velocity limits: [x, y, theta, torso_lift]
+        # x, y: ±0.5 m/s
+        self.velocity_limits_min[0] = -0.05  # base_x
+        self.velocity_limits_max[0] = 0.05
+        self.velocity_limits_min[1] = -0.05  # base_y  
+        self.velocity_limits_max[1] = 0.05
+        
+        # theta: ±π/2 rad/s
+        self.velocity_limits_min[2] = 0.1*(-np.pi/2)  # base_theta
+        self.velocity_limits_max[2] = 0.1*(np.pi/2)
+        
+        # torso_lift: reasonable default (same as x,y)
+        self.velocity_limits_min[3] = -0.05  # torso_lift
+        self.velocity_limits_max[3] = 0.05
+        
+        # Arm joint velocity limits
+        # First 4 arm joints: ±80°/s = ±1.396 rad/s
+        arm_first_four_limit = 20.0 * np.pi / 180.0  # Convert deg/s to rad/s
+        for i in range(4, 8):  # indices 4-7 are first 4 arm joints
+            self.velocity_limits_min[i] = -arm_first_four_limit
+            self.velocity_limits_max[i] = arm_first_four_limit
+            
+        # Last 3 arm joints (wrist): ±140°/s = ±2.443 rad/s  
+        arm_wrist_limit = 30.0 * np.pi / 180.0  # Convert deg/s to rad/s
+        for i in range(8, 11):  # indices 8-10 are last 3 arm joints (wrist)
+            self.velocity_limits_min[i] = -arm_wrist_limit
+            self.velocity_limits_max[i] = arm_wrist_limit
+
     def _initialize_kinematics(self):
         """Initialize kinematics solver"""
         # Get arm joint indices
@@ -265,8 +303,9 @@ class WholeBodyController(BaseController):
         # Translation (x, y, z) 
         # The torso_lift_joint origin is at xyz="-0.086875 0 0.37743" relative to base_link
         # So we need to add this offset plus the current torso_lift position
-        base_z_offset = 0.37743  # Base offset from URDF torso_lift_joint origin
-        T_base[:, 0, 3] = base_x
+        base_x_offset = -0.086875  # X offset from URDF torso_lift_joint origin
+        base_z_offset = 0.37743     # Z offset from URDF torso_lift_joint origin
+        T_base[:, 0, 3] = base_x + base_x_offset
         T_base[:, 1, 3] = base_y
         T_base[:, 2, 3] = base_z_offset + torso_lift
         
@@ -467,10 +506,16 @@ class WholeBodyController(BaseController):
                 
                 if len(posture_indices) > 0:
                     q_diff = q_np - q_retract_np
-                    # Apply regularization only to non-base DOF
+                    # Apply regularization to non-base DOF with special handling for root arm joint
                     for i in posture_indices:
-                        H_posture[i, i] = self.W_posture
-                        g_posture[i] = self.W_posture * self.timestep * q_diff[i]
+                        # Use higher weight for root arm joint (shoulder_pan at index 4)
+                        if i == 4:  # First arm joint (root arm joint)
+                            weight = self.config.root_arm_joint_regularization_weight
+                        else:
+                            weight = self.W_posture
+                        
+                        H_posture[i, i] = weight
+                        g_posture[i] = weight * self.timestep * q_diff[i]
             else:
                 H_posture = np.zeros((n_vars, n_vars))
                 g_posture = np.zeros(n_vars)
@@ -487,23 +532,17 @@ class WholeBodyController(BaseController):
         H = H_track + H_posture + H_damping
         g = g_track + g_posture + g_damping
         
-        # Ensure H is positive definite
-        H += 1e-3 * np.eye(n_vars)
+        # Ensure H is positive definites
+        H += self.lm_damping_factor * np.eye(n_vars)
         
         # Validate QP matrices
         if np.any(np.isnan(H)) or np.any(np.isinf(H)) or np.any(np.isnan(g)) or np.any(np.isinf(g)):
             print("Warning: Invalid QP matrices detected, using zero velocities")
             return torch.zeros((batch_size, self.total_dof), device=q_current.device, dtype=q_current.dtype)
 
-        # Constraints
-        # Joint velocity limits
-        if hasattr(self.config, 'velocity_limits') and self.config.velocity_limits is not None:
-            v_min, v_max = self.config.velocity_limits
-            lb = np.full(n_vars, v_min)
-            ub = np.full(n_vars, v_max)
-        else:
-            lb = np.full(n_vars, -1.0)  # Default limits
-            ub = np.full(n_vars, 1.0)
+        # Constraints - Use per-joint velocity limits
+        lb = self.velocity_limits_min[:n_vars]
+        ub = self.velocity_limits_max[:n_vars]
             
         # Joint position limits (via velocity integration)
         if hasattr(self.config, 'position_limits') and self.config.position_limits is not None:
@@ -674,24 +713,28 @@ class WholeBodyControllerConfig(ControllerConfig):
     force_limit: Union[float, List[float]] = 100.0
     
     # WBC weights
-    ee_tracking_weight: float = 1.0  # Reduced from 10.0 to be less aggressive
+    ee_tracking_weight: float = 1.0  # Moderate increase from 5.0 but not too aggressive
     """Weight for end-effector tracking objective"""
-    posture_regularization_weight: float = 2e-2  # Increased from 1.0 for stability
+    posture_regularization_weight: float = 2e-3  # Back to original value for stability
     """Weight for posture regularization"""
-    base_damping_weight: float = 1.5  # Increased from 1.5 to reduce oscillations
+    root_arm_joint_regularization_weight: float = 2e-2  # Higher weight for root arm joint (shoulder_pan)
+    """Weight for root arm joint posture regularization - higher to maintain proper arm orientation"""
+    base_damping_weight: float = 1.5  # Moderate reduction from 1.0
     """Weight for base damping"""
+    lm_damping_factor: float = 1e-3
+    """Levenberg-Marquardt damping factor for QP Hessian regularization"""
     
     # Solver parameters
-    max_iterations: int = 20  # Reduced for smaller per-step changes
+    max_iterations: int = 10  # Increased from 20 for better convergence chances
     """Maximum iterations for iterative IK"""
-    convergence_threshold: float = 1e-4  # Tighter convergence threshold
+    convergence_threshold: float = 1e-4  # Slightly relaxed from 1e-4 for practical convergence
     """Convergence threshold for IK"""
     
     # Limits
     pos_limits: Optional[tuple] = None
     """Position limits for end-effector (min, max)"""
-    velocity_limits: Optional[tuple] = (-0.5, 0.5)  # More conservative velocity limits
-    """Velocity limits for joints (min, max)"""
+    velocity_limits: Optional[tuple] = None  # Now handled per-joint in _setup_velocity_limits()
+    """Velocity limits - now automatically set based on joint types"""
     position_limits: Optional[tuple] = None
     """Position limits for joints (min, max)"""
     
@@ -699,11 +742,11 @@ class WholeBodyControllerConfig(ControllerConfig):
     neutral_posture: Optional[Array] = None
     """Neutral posture for regularization"""
     
-    # Collision avoidance
-    collision_margin: float = 0.02
-    """Safety margin for collision avoidance (2cm)"""
-    collision_detection_range: float = 0.10
-    """Range for collision detection (10cm)"""
+    # # Collision avoidance
+    # collision_margin: float = 0.02
+    # """Safety margin for collision avoidance (2cm)"""
+    # collision_detection_range: float = 0.10
+    # """Range for collision detection (10cm)"""
     
     # Control mode
     normalize_action: bool = False
